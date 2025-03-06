@@ -1,539 +1,585 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
 import asyncio
 import telethon
-from telethon.sync import TelegramClient
+from telethon import TelegramClient
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.errors import UsernameNotOccupiedError
-from datetime import datetime, timedelta
-import plotly.express as px
-import plotly.graph_objects as go
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
 import re
-import json
-import os
-import time
-from io import BytesIO
-import base64
+from datetime import datetime, timedelta
 
-# Настройка страницы Streamlit
-st.set_page_config(
-    page_title="Telegram Group Analyzer",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Инициализация сессии состояния
-if 'settings' not in st.session_state:
-    st.session_state.settings = {}
-if 'extra_accounts' not in st.session_state:
-    st.session_state.extra_accounts = []
-if 'login_complete' not in st.session_state:
-    st.session_state.login_complete = False
-
-# Главная функция для работы с Telegram API
-async def get_group_entity(client, group_link, error_container):
-    """Получение информации о группе по ссылке"""
-    try:
-        # Извлечение имени группы из ссылки
-        if 'https://t.me/' in group_link:
-            group_name = group_link.split('https://t.me/')[1].strip()
-        elif 't.me/' in group_link:
-            group_name = group_link.split('t.me/')[1].strip()
-        else:
-            group_name = group_link.strip()
-        
-        # Удаление лишних символов из названия группы
-        group_name = group_name.rstrip('/')
-        
-        try:
-            # Попытка получить информацию о группе
-            return await client.get_entity(group_name)
-        except (ValueError, UsernameNotOccupiedError):
-            # Если не удалось по имени, пробуем по полной ссылке
-            return await client.get_entity(group_link)
-        except telethon.errors.rpcerrorlist.UsernameInvalidError:
-            error_container.error(f"Недопустимое имя пользователя: {group_name}")
-            return None
-        except telethon.errors.rpcerrorlist.KeyUnregisteredError:
-            error_container.error(
-                "Ошибка API: Ключ не зарегистрирован в системе. "
-                "Пожалуйста, убедитесь, что вы правильно настроили API ключи и они активированы. "
-                "Активация ключей может занять до 24 часов после их создания."
-            )
-            return None
-    except Exception as e:
-        error_container.error(f"Ошибка при получении информации о группе {group_link}: {str(e)}")
-        return None
+# Настройка русской локали для matplotlib
+import matplotlib as mpl
+mpl.rcParams['font.family'] = 'DejaVu Sans'
 
 async def create_client(api_id, api_hash, phone, error_container):
-    """Создание клиента Telegram с обработкой ошибок"""
+    """Создание клиента Telegram API с обработкой ошибок"""
     if not api_id or not api_hash or not phone:
-        error_container.error("Необходимо указать API ID, API Hash и номер телефона")
+        error_container.error("Пожалуйста, заполните все поля API настроек")
         return None
     
     try:
         # Создание клиента
-        client = TelegramClient(f"session_{phone}", api_id, api_hash)
-        
-        # Попытка подключения
+        client = TelegramClient('session_name', int(api_id), api_hash)
         await client.connect()
         
         # Проверка авторизации
         if not await client.is_user_authorized():
-            # Запрос кода авторизации
             try:
-                await client.send_code_request(phone)
-                error_container.warning(f"Для авторизации аккаунта {phone} введите код, отправленный вам в Telegram:")
-                code = error_container.text_input(f"Код авторизации для {phone}")
+                # Отправка кода подтверждения
+                sent_code = await client.send_code_request(phone)
+                
+                # Запрос кода у пользователя
+                code = st.text_input("Введите код подтверждения, отправленный в Telegram")
                 
                 if code:
                     try:
+                        # Попытка входа с введенным кодом
                         await client.sign_in(phone, code)
-                        error_container.success(f"Аккаунт {phone} успешно авторизован!")
-                    except telethon.errors.rpcerrorlist.SessionPasswordNeededError:
-                        # Если включена двухфакторная аутентификация
-                        password = error_container.text_input(f"Введите пароль двухфакторной аутентификации для {phone}", type="password")
+                        st.success("Успешная авторизация!")
+                    except telethon.errors.SessionPasswordNeededError:
+                        # Если требуется пароль двухфакторной аутентификации
+                        password = st.text_input("Введите пароль двухфакторной аутентификации", type="password")
                         if password:
                             await client.sign_in(password=password)
-                            error_container.success(f"Аккаунт {phone} успешно авторизован!")
-            except telethon.errors.rpcerrorlist.FloodWaitError as e:
-                wait_time = e.seconds
-                error_container.error(f"Слишком много попыток! Пожалуйста, подождите {wait_time} секунд перед новой попыткой.")
-                await client.disconnect()
+                            st.success("Успешная авторизация с 2FA!")
+                        else:
+                            error_container.warning("Требуется пароль двухфакторной аутентификации")
+                            return None
+                    except Exception as e:
+                        error_container.error(f"Ошибка при вводе кода: {str(e)}")
+                        return None
+                else:
+                    error_container.info("Введите код подтверждения, отправленный в Telegram")
+                    return None
+            except telethon.errors.FloodWaitError as e:
+                error_container.error(f"Слишком много попыток входа. Подождите {e.seconds} секунд")
                 return None
-            except telethon.errors.rpcerrorlist.PhoneNumberInvalidError:
-                error_container.error(f"Номер телефона {phone} недействителен. Проверьте формат: +79123456789")
-                await client.disconnect()
+            except telethon.errors.PhoneNumberBannedError:
+                error_container.error("Этот номер телефона заблокирован в Telegram")
                 return None
-            except telethon.errors.rpcerrorlist.ApiIdInvalidError:
-                error_container.error("API ID или API Hash недействительны. Проверьте настройки.")
-                await client.disconnect()
+            except telethon.errors.PhoneNumberInvalidError:
+                error_container.error("Неверный формат номера телефона. Используйте формат +79123456789")
+                return None
+            except telethon.errors.ApiIdInvalidError:
+                error_container.error("Недействительные API ID или API Hash")
+                return None
+            except Exception as e:
+                error_container.error(f"Ошибка при авторизации: {str(e)}")
                 return None
         
         return client
-    except telethon.errors.rpcerrorlist.KeyUnregisteredError:
-        error_container.error(
-            "Ключ не зарегистрирован в системе. Убедитесь, что ваши API ключи активированы. "
-            "Это может занять до 24 часов после создания."
-        )
+    except telethon.errors.ApiIdInvalidError:
+        error_container.error("Недействительные API ID или API Hash")
+        return None
+    except ValueError:
+        error_container.error("API ID должен быть числом")
         return None
     except Exception as e:
-        error_container.error(f"Ошибка при создании клиента Telegram: {str(e)}")
+        error_container.error(f"Ошибка при создании клиента: {str(e)}")
         return None
 
-async def get_group_info(client, group_entity, error_container):
-    """Получение подробной информации о группе"""
+async def get_group_entity(client, group_link, error_container):
+    """Получение entity группы по ссылке"""
     try:
-        if hasattr(group_entity, 'username') and group_entity.username:
-            full_info = await client(GetFullChannelRequest(group_entity.username))
-        else:
-            full_info = await client(GetFullChannelRequest(group_entity.id))
+        if not group_link:
+            error_container.error("Укажите ссылку на группу или канал")
+            return None
         
-        return {
-            'id': group_entity.id,
-            'title': group_entity.title,
-            'username': getattr(group_entity, 'username', None),
-            'participants_count': full_info.full_chat.participants_count,
-            'about': full_info.full_chat.about,
-            'is_channel': isinstance(group_entity, telethon.tl.types.Channel),
-            'is_group': isinstance(group_entity, telethon.tl.types.Channel) and getattr(group_entity, 'megagroup', False),
-            'date': getattr(group_entity, 'date', None),
-            'photo': getattr(group_entity, 'photo', None) != None
-        }
+        # Извлечение имени группы из ссылки
+        group_name = None
+        if 't.me/' in group_link:
+            group_name = group_link.split('t.me/')[1].split('/')[0].split('?')[0]
+        elif group_link.startswith('@'):
+            group_name = group_link[1:]
+        else:
+            group_name = group_link
+        
+        # Удаление + из имени группы (если есть)
+        group_name = group_name.replace('+', '')
+        
+        try:
+            # Получение entity группы
+            entity = await client.get_entity(group_name)
+            return entity
+        except telethon.errors.UsernameNotOccupiedError:
+            error_container.error(f"Группа или канал с именем {group_name} не существует")
+            return None
+        except telethon.errors.UsernameInvalidError:
+            error_container.error(f"Недопустимое имя пользователя: {group_name}")
+            return None
+        except telethon.errors.InviteHashInvalidError:
+            error_container.error("Недействительный хэш приглашения")
+            return None
+        except telethon.errors.ChannelPrivateError:
+            error_container.error("Этот канал/группа является приватным. Сначала вступите в группу.")
+            return None
     except Exception as e:
         error_container.error(f"Ошибка при получении информации о группе: {str(e)}")
         return None
 
-async def get_messages_stats(client, group_entity, days_count, error_container, progress_bar=None):
-    """Получение статистики сообщений группы"""
+async def get_group_info(client, group_entity, error_container):
+    """Получение подробной информации о группе или канале"""
     try:
-        # Определение временного промежутка
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days_count)
+        if hasattr(group_entity, 'megagroup') or hasattr(group_entity, 'gigagroup') or hasattr(group_entity, 'broadcast'):
+            # Это канал или супергруппа
+            full_entity = await client(GetFullChannelRequest(channel=group_entity))
+            
+            # Базовая информация
+            info = {
+                'title': group_entity.title,
+                'username': group_entity.username if hasattr(group_entity, 'username') else "Отсутствует",
+                'type': 'Канал' if getattr(group_entity, 'broadcast', False) else 'Супергруппа',
+                'id': group_entity.id,
+                'members_count': full_entity.full_chat.participants_count if hasattr(full_entity.full_chat, 'participants_count') else "Неизвестно",
+                'description': full_entity.full_chat.about if hasattr(full_entity.full_chat, 'about') else "Отсутствует",
+                'creation_date': group_entity.date.strftime('%d.%m.%Y %H:%M:%S') if hasattr(group_entity, 'date') else "Неизвестно",
+                'verified': getattr(group_entity, 'verified', False),
+                'restricted': getattr(group_entity, 'restricted', False),
+                'scam': getattr(group_entity, 'scam', False),
+                'fake': getattr(group_entity, 'fake', False),
+            }
+        else:
+            # Это обычная группа
+            info = {
+                'title': group_entity.title if hasattr(group_entity, 'title') else "Неизвестно",
+                'username': group_entity.username if hasattr(group_entity, 'username') else "Отсутствует",
+                'type': 'Группа',
+                'id': group_entity.id,
+                'members_count': "Неизвестно", # Для обычных групп требуется отдельный запрос
+                'description': "Отсутствует", # Для обычных групп требуется отдельный запрос
+                'creation_date': group_entity.date.strftime('%d.%m.%Y %H:%M:%S') if hasattr(group_entity, 'date') else "Неизвестно",
+                'verified': getattr(group_entity, 'verified', False),
+                'restricted': getattr(group_entity, 'restricted', False),
+                'scam': getattr(group_entity, 'scam', False),
+                'fake': getattr(group_entity, 'fake', False),
+            }
         
-        # Структуры для сбора статистики
-        messages_per_day = {}
-        top_users = {}
-        top_users_by_reactions = {}
-        reactions_per_day = {}
-        views_per_day = {}
-        forwards_per_day = {}
-        replies_per_day = {}
-        total_messages = 0
-        total_views = 0
-        
-        # Инициализация дней для статистики
-        current_date = start_date
-        while current_date <= end_date:
-            date_str = current_date.strftime('%Y-%m-%d')
-            messages_per_day[date_str] = 0
-            reactions_per_day[date_str] = 0
-            views_per_day[date_str] = 0
-            forwards_per_day[date_str] = 0
-            replies_per_day[date_str] = 0
-            current_date += timedelta(days=1)
-        
-        # Получение сообщений
-        async for message in client.iter_messages(group_entity, offset_date=end_date, limit=None):
-            # Проверка, находится ли сообщение в нужном временном диапазоне
-            if message.date < start_date:
-                break
-            
-            # Обновление счетчика общего количества сообщений
-            total_messages += 1
-            
-            # Обновление прогресса (если есть прогресс-бар)
-            if progress_bar is not None:
-                progress_bar.progress((end_date - message.date).total_seconds() / (end_date - start_date).total_seconds())
-            
-            # Обновление статистики по дням
-            date_str = message.date.strftime('%Y-%m-%d')
-            messages_per_day[date_str] = messages_per_day.get(date_str, 0) + 1
-            
-            # Статистика просмотров
-            if hasattr(message, 'views') and message.views:
-                views_per_day[date_str] = views_per_day.get(date_str, 0) + message.views
-                total_views += message.views
-            
-            # Статистика пересылок
-            if hasattr(message, 'forwards') and message.forwards:
-                forwards_per_day[date_str] = forwards_per_day.get(date_str, 0) + message.forwards
-            
-            # Статистика ответов
-            if message.replies:
-                replies_per_day[date_str] = replies_per_day.get(date_str, 0) + message.replies.replies
-            
-            # Статистика по пользователям
-            if message.sender_id:
-                sender_id = message.sender_id
-                if sender_id not in top_users:
-                    try:
-                        sender = await client.get_entity(sender_id)
-                        sender_name = getattr(sender, 'first_name', '') + ' ' + getattr(sender, 'last_name', '')
-                        if not sender_name.strip():
-                            sender_name = getattr(sender, 'title', str(sender_id))
-                    except:
-                        sender_name = str(sender_id)
-                    
-                    top_users[sender_id] = {
-                        'name': sender_name,
-                        'count': 0,
-                        'views': 0,
-                        'reactions': 0
-                    }
-                
-                top_users[sender_id]['count'] += 1
-                
-                if hasattr(message, 'views') and message.views:
-                    top_users[sender_id]['views'] += message.views
-            
-            # Статистика реакций
-            if hasattr(message, 'reactions') and message.reactions:
-                reaction_count = sum(reaction.count for reaction in message.reactions.results)
-                reactions_per_day[date_str] = reactions_per_day.get(date_str, 0) + reaction_count
-                
-                if message.sender_id:
-                    top_users[message.sender_id]['reactions'] += reaction_count
-        
-        # Сортировка топ пользователей по количеству сообщений
-        sorted_users = sorted(top_users.items(), key=lambda x: x[1]['count'], reverse=True)
-        
-        # Сортировка топ пользователей по количеству реакций
-        sorted_users_by_reactions = sorted(top_users.items(), key=lambda x: x[1]['reactions'], reverse=True)
-        
-        # Подготовка данных для графиков
-        dates = list(messages_per_day.keys())
-        messages_count = list(messages_per_day.values())
-        reactions_count = [reactions_per_day.get(date, 0) for date in dates]
-        views_count = [views_per_day.get(date, 0) for date in dates]
-        forwards_count = [forwards_per_day.get(date, 0) for date in dates]
-        replies_count = [replies_per_day.get(date, 0) for date in dates]
-        
-        return {
-            'total_messages': total_messages,
-            'total_views': total_views,
-            'messages_per_day': {'dates': dates, 'values': messages_count},
-            'reactions_per_day': {'dates': dates, 'values': reactions_count},
-            'views_per_day': {'dates': dates, 'values': views_count},
-            'forwards_per_day': {'dates': dates, 'values': forwards_count},
-            'replies_per_day': {'dates': dates, 'values': replies_count},
-            'top_users': sorted_users[:10],  # Топ-10 пользователей по сообщениям
-            'top_users_by_reactions': sorted_users_by_reactions[:10]  # Топ-10 пользователей по реакциям
-        }
+        return info
+    except telethon.errors.ChannelPrivateError:
+        error_container.error("Этот канал/группа является приватным. Сначала вступите в группу.")
+        return None
     except Exception as e:
-        error_container.error(f"Ошибка при получении статистики сообщений: {str(e)}")
+        error_container.error(f"Ошибка при получении информации о группе: {str(e)}")
         return None
 
 def render_group_info(group_info):
     """Отображение информации о группе"""
-    st.subheader("Информация о группе")
+    st.subheader(f"Информация о группе: {group_info['title']}")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown(f"**Название:** {group_info['title']}")
-        st.markdown(f"**ID:** {group_info['id']}")
-        if group_info['username']:
-            st.markdown(f"**Имя пользователя:** @{group_info['username']}")
-        st.markdown(f"**Количество участников:** {group_info['participants_count']:,}")
+        st.markdown(f"**Тип:** {group_info['type']}")
+        st.markdown(f"**ID:** `{group_info['id']}`")
+        st.markdown(f"**Имя пользователя:** @{group_info['username'] if group_info['username'] != 'Отсутствует' else '-'}")
     
     with col2:
-        group_type = "Канал" if not group_info['is_group'] else "Группа"
-        st.markdown(f"**Тип:** {group_type}")
-        if group_info['date']:
-            st.markdown(f"**Дата создания:** {group_info['date'].strftime('%Y-%m-%d')}")
-        st.markdown(f"**Фото профиля:** {'Есть' if group_info['photo'] else 'Нет'}")
+        st.markdown(f"**Количество участников:** {group_info['members_count']}")
+        st.markdown(f"**Дата создания:** {group_info['creation_date']}")
+        
+        # Статусы
+        statuses = []
+        if group_info['verified']:
+            statuses.append("✅ Верифицирован")
+        if group_info['restricted']:
+            statuses.append("⚠️ Имеет ограничения")
+        if group_info['scam']:
+            statuses.append("🚫 Отмечен как скам")
+        if group_info['fake']:
+            statuses.append("🚫 Отмечен как фейк")
+        
+        if statuses:
+            st.markdown("**Статусы:** " + ", ".join(statuses))
     
-    if group_info['about']:
+    # Описание
+    if group_info['description'] != "Отсутствует":
         st.markdown("**Описание:**")
-        st.markdown(f"_{group_info['about']}_")
+        st.markdown(f"> {group_info['description']}")
 
-def render_message_stats(stats, days_count):
+async def get_messages_stats(client, group_entity, days_count, error_container, progress_bar=None):
+    """Сбор статистики сообщений"""
+    try:
+        # Определение временного диапазона
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days_count)
+        
+        # Инициализация статистики
+        stats = {
+            'total_messages': 0,
+            'total_views': 0,
+            'total_reactions': 0,
+            'total_replies': 0,
+            'messages_per_day': {'dates': [], 'values': []},
+            'views_per_day': {'dates': [], 'values': []},
+            'reactions_per_day': {'dates': [], 'values': []},
+            'replies_per_day': {'dates': [], 'values': []},
+            'top_users': {},
+            'top_users_by_reactions': {}
+        }
+        
+        # Инициализация данных по дням
+        current_date = start_date
+        while current_date <= end_date:
+            date_str = current_date.strftime('%Y-%m-%d')
+            stats['messages_per_day']['dates'].append(date_str)
+            stats['messages_per_day']['values'].append(0)
+            stats['views_per_day']['dates'].append(date_str)
+            stats['views_per_day']['values'].append(0)
+            stats['reactions_per_day']['dates'].append(date_str)
+            stats['reactions_per_day']['values'].append(0)
+            stats['replies_per_day']['dates'].append(date_str)
+            stats['replies_per_day']['values'].append(0)
+            current_date += timedelta(days=1)
+        
+        # Получение сообщений
+        messages_iter = client.iter_messages(
+            group_entity,
+            offset_date=end_date,
+            reverse=True,
+            limit=None
+        )
+        
+        # Обработка сообщений
+        messages_processed = 0
+        async for message in messages_iter:
+            # Прекращаем, если вышли за пределы диапазона
+            if message.date < start_date:
+                continue
+            if message.date > end_date:
+                break
+            
+            # Обновление индикатора прогресса
+            messages_processed += 1
+            if messages_processed % 100 == 0 and progress_bar:
+                progress_percent = min(0.99, messages_processed / 1000)  # Предполагаемый максимум - 1000 сообщений
+                progress_bar.progress(progress_percent, f"Обработано {messages_processed} сообщений")
+            
+            # Общая статистика
+            stats['total_messages'] += 1
+            
+            # Просмотры (только для каналов)
+            if hasattr(message, 'views') and message.views:
+                stats['total_views'] += message.views
+            
+            # Реакции
+            reactions_count = 0
+            if hasattr(message, 'reactions') and message.reactions:
+                for reaction in message.reactions.results:
+                    reactions_count += reaction.count
+                stats['total_reactions'] += reactions_count
+            
+            # Ответы
+            if hasattr(message, 'replies') and message.replies:
+                stats['total_replies'] += message.replies.replies
+            
+            # Статистика по дням
+            msg_date = message.date.strftime('%Y-%m-%d')
+            day_index = stats['messages_per_day']['dates'].index(msg_date) if msg_date in stats['messages_per_day']['dates'] else -1
+            
+            if day_index >= 0:
+                stats['messages_per_day']['values'][day_index] += 1
+                
+                if hasattr(message, 'views') and message.views:
+                    stats['views_per_day']['values'][day_index] += message.views
+                
+                if reactions_count > 0:
+                    stats['reactions_per_day']['values'][day_index] += reactions_count
+                
+                if hasattr(message, 'replies') and message.replies:
+                    stats['replies_per_day']['values'][day_index] += message.replies.replies
+            
+            # Статистика по пользователям
+            if message.sender_id:
+                sender_id = str(message.sender_id)
+                
+                # Добавляем пользователя, если его нет в статистике
+                if sender_id not in stats['top_users']:
+                    try:
+                        sender = await message.get_sender()
+                        sender_name = sender.first_name
+                        if hasattr(sender, 'last_name') and sender.last_name:
+                            sender_name += f" {sender.last_name}"
+                        if hasattr(sender, 'username') and sender.username:
+                            sender_name += f" (@{sender.username})"
+                    except:
+                        sender_name = f"User {sender_id}"
+                    
+                    stats['top_users'][sender_id] = {
+                        'name': sender_name,
+                        'count': 0
+                    }
+                    
+                    stats['top_users_by_reactions'][sender_id] = {
+                        'name': sender_name,
+                        'reactions': 0
+                    }
+                
+                # Увеличиваем счетчики
+                stats['top_users'][sender_id]['count'] += 1
+                
+                if reactions_count > 0:
+                    stats['top_users_by_reactions'][sender_id]['reactions'] += reactions_count
+        
+        # Сортировка пользователей
+        stats['top_users'] = {k: v for k, v in sorted(
+            stats['top_users'].items(), 
+            key=lambda item: item[1]['count'], 
+            reverse=True
+        )}
+        
+        stats['top_users_by_reactions'] = {k: v for k, v in sorted(
+            stats['top_users_by_reactions'].items(), 
+            key=lambda item: item[1]['reactions'], 
+            reverse=True
+        )}
+        
+        if progress_bar:
+            progress_bar.progress(1.0, "Сбор статистики завершен!")
+        
+        return stats
+    except Exception as e:
+        error_container.error(f"Ошибка при сборе статистики сообщений: {str(e)}")
+        return None
+
+def render_message_stats(stats):
     """Отображение статистики сообщений"""
-    if not stats:
-        st.warning("Нет данных для отображения")
-        return
+    st.subheader("Общая статистика")
     
-    st.subheader("Статистика активности")
+    col1, col2, col3, col4 = st.columns(4)
     
-    # Основные метрики
-    col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Всего сообщений", f"{stats['total_messages']:,}")
+        st.metric("Всего сообщений", stats['total_messages'])
+    
     with col2:
-        avg_messages = stats['total_messages'] / days_count if days_count > 0 else 0
-        st.metric("Среднее кол-во сообщений в день", f"{avg_messages:.1f}")
+        st.metric("Всего просмотров", f"{stats['total_views']:,}".replace(',', ' '))
+    
     with col3:
-        st.metric("Всего просмотров", f"{stats['total_views']:,}")
+        st.metric("Всего реакций", stats['total_reactions'])
+    
+    with col4:
+        st.metric("Всего ответов", stats['total_replies'])
     
     # График сообщений по дням
     st.subheader("Активность по дням")
     
-    fig, ax = plt.subplots(figsize=(10, 6))
-    dates = [datetime.strptime(date, '%Y-%m-%d').date() for date in stats['messages_per_day']['dates']]
-    ax.plot(dates, stats['messages_per_day']['values'], marker='o', linestyle='-', color='#1f77b4', label='Сообщения')
+    fig, ax = plt.subplots(figsize=(10, 5))
     
-    ax.set_xlabel('Дата')
-    ax.set_ylabel('Количество сообщений')
-    ax.grid(True, linestyle='--', alpha=0.7)
-    ax.set_title('Количество сообщений по дням')
+    # Форматируем даты для лучшего отображения
+    dates = [datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m') for date in stats['messages_per_day']['dates']]
     
-    # Форматирование дат на оси X
-    plt.xticks(rotation=45)
-    fig.tight_layout()
+    x = range(len(dates))
+    plt.bar(x, stats['messages_per_day']['values'], color='blue', alpha=0.7, label='Сообщения')
+    plt.xticks(x, dates, rotation=45)
+    plt.xlabel('Дата')
+    plt.ylabel('Количество сообщений')
+    plt.title('Активность сообщений по дням')
+    plt.tight_layout()
     
     st.pyplot(fig)
     
     # График просмотров по дням
-    if any(stats['views_per_day']['values']):
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(dates, stats['views_per_day']['values'], marker='o', linestyle='-', color='#ff7f0e', label='Просмотры')
+    if sum(stats['views_per_day']['values']) > 0:
+        st.subheader("Просмотры по дням")
         
-        ax.set_xlabel('Дата')
-        ax.set_ylabel('Количество просмотров')
-        ax.grid(True, linestyle='--', alpha=0.7)
-        ax.set_title('Количество просмотров по дням')
+        fig, ax = plt.subplots(figsize=(10, 5))
         
-        plt.xticks(rotation=45)
-        fig.tight_layout()
+        plt.bar(x, stats['views_per_day']['values'], color='green', alpha=0.7, label='Просмотры')
+        plt.xticks(x, dates, rotation=45)
+        plt.xlabel('Дата')
+        plt.ylabel('Количество просмотров')
+        plt.title('Просмотры сообщений по дням')
+        plt.tight_layout()
         
         st.pyplot(fig)
     
     # График реакций по дням
-    if any(stats['reactions_per_day']['values']):
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(dates, stats['reactions_per_day']['values'], marker='o', linestyle='-', color='#2ca02c', label='Реакции')
+    if sum(stats['reactions_per_day']['values']) > 0:
+        st.subheader("Реакции по дням")
         
-        ax.set_xlabel('Дата')
-        ax.set_ylabel('Количество реакций')
-        ax.grid(True, linestyle='--', alpha=0.7)
-        ax.set_title('Количество реакций по дням')
+        fig, ax = plt.subplots(figsize=(10, 5))
         
-        plt.xticks(rotation=45)
-        fig.tight_layout()
+        plt.bar(x, stats['reactions_per_day']['values'], color='purple', alpha=0.7, label='Реакции')
+        plt.xticks(x, dates, rotation=45)
+        plt.xlabel('Дата')
+        plt.ylabel('Количество реакций')
+        plt.title('Реакции на сообщения по дням')
+        plt.tight_layout()
         
         st.pyplot(fig)
     
     # График ответов по дням
-    if any(stats['replies_per_day']['values']):
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(dates, stats['replies_per_day']['values'], marker='o', linestyle='-', color='#d62728', label='Ответы')
+    if sum(stats['replies_per_day']['values']) > 0:
+        st.subheader("Ответы по дням")
         
-        ax.set_xlabel('Дата')
-        ax.set_ylabel('Количество ответов')
-        ax.grid(True, linestyle='--', alpha=0.7)
-        ax.set_title('Количество ответов по дням')
+        fig, ax = plt.subplots(figsize=(10, 5))
         
-        plt.xticks(rotation=45)
-        fig.tight_layout()
+        plt.bar(x, stats['replies_per_day']['values'], color='orange', alpha=0.7, label='Ответы')
+        plt.xticks(x, dates, rotation=45)
+        plt.xlabel('Дата')
+        plt.ylabel('Количество ответов')
+        plt.title('Ответы на сообщения по дням')
+        plt.tight_layout()
         
         st.pyplot(fig)
     
-    # Топ пользователей по сообщениям
-    st.subheader("Топ пользователей по количеству сообщений")
-    
+    # Топ пользователей
     if stats['top_users']:
-        top_users_data = [(user[1]['name'], user[1]['count']) for user in stats['top_users']]
-        top_users_df = pd.DataFrame(top_users_data, columns=['Пользователь', 'Сообщения'])
+        st.subheader("Топ 10 активных пользователей")
+        
+        top_10_users = list(stats['top_users'].items())[:10]
+        
+        user_names = [user[1]['name'] for user in top_10_users]
+        user_counts = [user[1]['count'] for user in top_10_users]
         
         fig, ax = plt.subplots(figsize=(10, 6))
-        bars = ax.bar(top_users_df['Пользователь'], top_users_df['Сообщения'], color='#1f77b4')
         
-        ax.set_xlabel('Пользователь')
-        ax.set_ylabel('Количество сообщений')
-        ax.set_title('Топ пользователей по количеству сообщений')
-        
-        # Поворот подписей на оси X для лучшей читаемости
-        plt.xticks(rotation=45, ha='right')
-        
-        # Добавление значений над столбцами
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                    f'{int(height)}', ha='center', va='bottom')
-        
-        fig.tight_layout()
+        plt.barh(range(len(user_names)), user_counts, color='blue', alpha=0.7)
+        plt.yticks(range(len(user_names)), user_names)
+        plt.xlabel('Количество сообщений')
+        plt.title('Топ 10 активных пользователей')
+        plt.tight_layout()
         
         st.pyplot(fig)
-        
-        # Таблица с данными
-        st.dataframe(top_users_df)
-    else:
-        st.info("Нет данных о сообщениях пользователей")
     
     # Топ пользователей по реакциям
-    if any(user[1]['reactions'] for user in stats['top_users_by_reactions']):
-        st.subheader("Топ пользователей по полученным реакциям")
+    if stats['top_users_by_reactions'] and sum(user['reactions'] for user in stats['top_users_by_reactions'].values()) > 0:
+        st.subheader("Топ 10 пользователей по реакциям")
         
-        top_users_reactions_data = [(user[1]['name'], user[1]['reactions']) for user in stats['top_users_by_reactions'] if user[1]['reactions'] > 0]
-        if top_users_reactions_data:
-            top_users_reactions_df = pd.DataFrame(top_users_reactions_data, columns=['Пользователь', 'Реакции'])
-            
+        top_10_users_reactions = list(stats['top_users_by_reactions'].items())[:10]
+        
+        user_names = [user[1]['name'] for user in top_10_users_reactions]
+        user_reactions = [user[1]['reactions'] for user in top_10_users_reactions]
+        
+        if sum(user_reactions) > 0:  # Проверяем, есть ли вообще реакции
             fig, ax = plt.subplots(figsize=(10, 6))
-            bars = ax.bar(top_users_reactions_df['Пользователь'], top_users_reactions_df['Реакции'], color='#2ca02c')
             
-            ax.set_xlabel('Пользователь')
-            ax.set_ylabel('Количество реакций')
-            ax.set_title('Топ пользователей по полученным реакциям')
-            
-            plt.xticks(rotation=45, ha='right')
-            
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                        f'{int(height)}', ha='center', va='bottom')
-            
-            fig.tight_layout()
+            plt.barh(range(len(user_names)), user_reactions, color='purple', alpha=0.7)
+            plt.yticks(range(len(user_names)), user_names)
+            plt.xlabel('Количество реакций')
+            plt.title('Топ 10 пользователей по полученным реакциям')
+            plt.tight_layout()
             
             st.pyplot(fig)
-            
-            st.dataframe(top_users_reactions_df)
-        else:
-            st.info("Нет данных о реакциях на сообщения пользователей")
 
-async def main():
+def main():
     st.set_page_config(
-        page_title="Анализатор Telegram-групп",
+        page_title="Telegram Group Analyzer",
         page_icon="📊",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    st.title("📊 Анализатор Telegram-групп")
-    st.markdown("""
-    Этот инструмент позволяет получить подробную статистику о Telegram-группах и каналах.
-    Введите ссылку на группу и настройте параметры анализа.
-    """)
+    st.title("📊 Telegram Group Analyzer")
+    st.markdown("Инструмент для анализа групп и каналов Telegram")
     
-    # Контейнер для сообщений об ошибках
-    error_container = st.empty()
-    
-    # Боковая панель с настройками и авторизацией
+    # Сайдбар для ввода данных
     with st.sidebar:
         st.header("Настройки")
         
-        st.subheader("API настройки")
-        api_id = st.text_input("API ID", help="API ID от my.telegram.org")
-        api_hash = st.text_input("API Hash", help="API Hash от my.telegram.org", type="password")
-        phone = st.text_input("Номер телефона", help="Номер телефона с кодом страны, например +79123456789")
+        # Вкладки для разных методов авторизации
+        auth_tab = st.radio(
+            "Выберите способ авторизации",
+            ["По номеру телефона", "По строке сессии"]
+        )
         
-        st.subheader("Параметры анализа")
-        days_count = st.slider("Количество дней для анализа", 1, 30, 7, help="За какой период анализировать сообщения")
+        error_container = st.empty()
         
-        st.markdown("---")
-        st.markdown("### О приложении")
-        st.markdown("""
-        Анализатор групп Telegram позволяет получить подробную статистику по активности в группах и каналах.
-        
-        **Как использовать:**
-        1. Введите свои API данные (получить на [my.telegram.org](https://my.telegram.org))
-        2. Укажите ссылку на группу для анализа
-        3. Настройте период анализа
-        4. Нажмите "Начать анализ"
-        
-        **Примечание:** Приложение работает локально, ваши данные не передаются третьим лицам.
-        """)
-    
-    # Основная часть - ввод ссылки и отображение результатов
-    group_link = st.text_input("Введите ссылку на группу или канал Telegram", help="Например, https://t.me/group_name или @group_name")
-    
-    analyze_button = st.button("Начать анализ", type="primary")
-    
-    if analyze_button and group_link:
-        with st.spinner("Подключение к Telegram API..."):
-            # Создание клиента
-            client = await create_client(api_id, api_hash, phone, error_container)
+        if auth_tab == "По номеру телефона":
+            api_id = st.text_input("API ID", placeholder="12345", type="password")
+            api_hash = st.text_input("API Hash", placeholder="0123456789abcdef0123456789abcdef", type="password")
+            phone = st.text_input("Номер телефона", placeholder="+79123456789")
             
-            if client is not None and await client.is_user_authorized():
-                with st.spinner("Получение информации о группе..."):
-                    # Получение информации о группе
-                    group_entity = await get_group_entity(client, group_link, error_container)
-                    
-                    if group_entity:
-                        # Получение подробной информации о группе
-                        group_info = await get_group_info(client, group_entity, error_container)
-                        
-                        if group_info:
-                            # Отображение информации о группе
-                            render_group_info(group_info)
-                            
-                            # Сбор статистики сообщений
-                            with st.spinner(f"Анализ сообщений за последние {days_count} дней..."):
-                                progress_bar = st.progress(0)
-                                message_stats = await get_messages_stats(client, group_entity, days_count, error_container, progress_bar)
-                                progress_bar.empty()
-                            
-                            # Отображение статистики сообщений
-                            if message_stats:
-                                render_message_stats(message_stats, days_count)
-                            else:
-                                st.warning("Не удалось получить статистику сообщений")
-                        
-                # Закрытие клиента
-                await client.disconnect()
+            st.markdown("""
+            📝 **Как получить API ID и API Hash:**
+            1. Перейдите на [my.telegram.org](https://my.telegram.org/auth)
+            2. Войдите в свой аккаунт
+            3. Нажмите "API development tools"
+            4. Создайте новое приложение
+            5. Скопируйте API ID и API Hash
+            """)
+            
+            # Переменная сессии для хранения кода
+            session_state = st.session_state
+            if 'auth_code' not in session_state:
+                session_state.auth_code = ""
+            
+            auth_code = st.text_input("Код авторизации (отправлен в Telegram)", 
+                                     value=session_state.auth_code,
+                                     placeholder="Введите код после запуска",
+                                     key="auth_code_input")
+            
+            session_state.auth_code = auth_code
+        
+        else:  # По строке сессии
+            session_string = st.text_area("Строка сессии", placeholder="Вставьте строку сессии...", height=100, type="password")
+        
+        group_link = st.text_input("Ссылка на группу или канал", placeholder="https://t.me/example или @example")
+        days_count = st.slider("Период анализа (дней)", min_value=1, max_value=30, value=7)
+        
+        run_button = st.button("Запустить анализ", type="primary")
     
-    # Пустой запуск без нажатия кнопки
-    elif not analyze_button and group_link:
-        st.info("Нажмите 'Начать анализ' для получения информации о группе")
-    elif analyze_button and not group_link:
-        st.warning("Пожалуйста, введите ссылку на группу или канал")
+    # Основной контейнер для результатов
+    result_container = st.container()
+    
+    # Обработка запроса
+    if run_button:
+        with result_container:
+            progress_bar = st.progress(0, "Подготовка...")
+            
+            # Создание и авторизация клиента
+            if auth_tab == "По номеру телефона":
+                client = create_client_by_phone(api_id, api_hash, phone, error_container, session_state.auth_code)
+            else:
+                client = create_client_by_session(session_string, error_container)
+            
+            if client:
+                progress_bar.progress(0.2, "Авторизация выполнена")
+                
+                # Запуск асинхронных функций
+                async def run_analysis():
+                    try:
+                        await client.connect()
+                        
+                        # Получение данных о группе
+                        progress_bar.progress(0.3, "Получение информации о группе...")
+                        group_entity = await get_group_entity(client, group_link, error_container)
+                        
+                        if group_entity:
+                            # Информация о группе
+                            group_info = await get_group_info(client, group_entity, error_container)
+                            
+                            if group_info:
+                                progress_bar.progress(0.4, "Группа найдена")
+                                render_group_info(group_info)
+                                
+                                # Анализ сообщений
+                                progress_bar.progress(0.5, "Анализ сообщений...")
+                                st.subheader("Анализ сообщений")
+                                st.write(f"Сбор статистики за последние {days_count} дней")
+                                
+                                messages_stats = await get_messages_stats(client, group_entity, days_count, error_container, progress_bar)
+                                
+                                if messages_stats:
+                                    render_message_stats(messages_stats)
+                                else:
+                                    st.error("Не удалось получить статистику сообщений")
+                            else:
+                                st.error("Не удалось получить информацию о группе")
+                        else:
+                            st.error("Не удалось получить доступ к группе")
+                    
+                    finally:
+                        await client.disconnect()
+                
+                # Запуск асинхронного анализа
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(run_analysis())
+                finally:
+                    loop.close()
 
 if __name__ == "__main__":
-    import asyncio
-    import telethon
-    from telethon import TelegramClient
-    from telethon.tl.functions.channels import GetFullChannelRequest
-    import pandas as pd
-    import streamlit as st
-    import matplotlib.pyplot as plt
-    import re
-    from datetime import datetime, timedelta
-    
-    # Настройка русской локали для matplotlib
-    import matplotlib as mpl
-    mpl.rcParams['font.family'] = 'DejaVu Sans'
-    
-    # Запуск асинхронного main
-    asyncio.run(main())
+    main()
