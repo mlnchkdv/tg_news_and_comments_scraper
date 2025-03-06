@@ -1,465 +1,493 @@
-import streamlit as st
-import asyncio
-import pandas as pd
-import os
 import re
+import asyncio
 import time
-import random
-from telethon import TelegramClient, sync, errors
+import pandas as pd
+import io
+import telethon
+from telethon.sync import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
-from io import BytesIO
 from datetime import datetime, timedelta
+import streamlit as st
+import plotly.express as px
+from telethon.tl.types import InputPeerChannel
+from telethon.tl.functions.channels import GetFullChannelRequest, GetParticipantsRequest
+from telethon.tl.types import ChannelParticipantsSearch
 
-# Page config
+# Configure page
 st.set_page_config(
-    page_title="Экстрактор сообщений Telegram 📱",
-    page_icon="📱",
-    layout="wide"
+    page_title="Telegram Message Extractor",
+    page_icon="🔎",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Title and description
-st.title("📱 Экстрактор сообщений из групп Telegram")
-st.markdown("""
-Это приложение позволяет извлекать сообщения из указанных групп Telegram на основе ключевых слов или выражений.
-Введите данные вашего API, укажите группы и ключевые слова для поиска, затем загрузите результаты.
-Вы можете указать несколько API-ключей для балансировки нагрузки между аккаунтами. 🚀
-""")
+# Helper functions
+def format_time(seconds):
+    """Format time in seconds to a readable string."""
+    if seconds < 60:
+        return f"{seconds:.1f} сек"
+    elif seconds < 3600:
+        minutes = seconds / 60
+        return f"{minutes:.1f} мин"
+    else:
+        hours = seconds / 3600
+        return f"{hours:.1f} ч"
 
-# Telegram Extractor functions
-async def check_account_status(client):
-    """Проверка статуса аккаунта (забанен или нет)"""
-    try:
-        # Try to get dialogs as a simple check
-        await client.get_dialogs(limit=1)
-        return True, "✅ Аккаунт активен"
-    except errors.UserDeactivatedBanError:
-        return False, "❌ Аккаунт забанен"
-    except errors.AuthKeyUnregisteredError:
-        return False, "⚠️ Сессия истекла"
-    except Exception as e:
-        return False, f"⚠️ Ошибка проверки аккаунта: {str(e)}"
-
-async def extract_messages(client, group_links, keyword, limit=1000, progress_callback=None):
-    """
-    Извлечение сообщений из указанных групп Telegram, содержащих ключевое слово
-    """
-    results = []
-    total_groups = len(group_links)
+def estimate_remaining_time(elapsed_time, progress):
+    """Estimate remaining time based on elapsed time and progress."""
+    if progress <= 0:
+        return "неизвестно"
     
-    for i, group_link in enumerate(group_links):
-        try:
-            # Update progress
-            if progress_callback:
-                progress_callback(f"⏳ Обработка группы {i+1}/{total_groups}: {group_link}", (i / total_groups) * 0.8)
-            
-            # Handle group link format (remove https://t.me/ if present)
-            if 'https://t.me/' in group_link:
-                group_name = group_link.split('https://t.me/')[1]
-            else:
-                group_name = group_link
-            
-            # Get the entity (channel/group)
-            entity = await client.get_entity(group_name)
-            
-            # Get messages
-            messages = await client(GetHistoryRequest(
-                peer=entity,
-                limit=limit,
-                offset_date=None,
-                offset_id=0,
-                max_id=0,
-                min_id=0,
-                add_offset=0,
-                hash=0
-            ))
-            
-            # Filter messages containing the keyword (case insensitive)
-            pattern = re.compile(keyword, re.IGNORECASE)
-            
-            for msg_idx, message in enumerate(messages.messages):
-                # Update progress more frequently
-                if progress_callback and msg_idx % 100 == 0:
-                    progress_value = (i / total_groups) * 0.8 + (msg_idx / len(messages.messages)) * 0.2 / total_groups
-                    progress_callback(f"🔍 Анализ сообщений в группе {group_name}: {msg_idx}/{len(messages.messages)}", progress_value)
-                
-                if message.message and pattern.search(message.message):
-                    # Get message sender
-                    try:
-                        if message.from_id:
-                            sender = await client.get_entity(message.from_id)
-                            sender_name = f"{sender.first_name} {sender.last_name if sender.last_name else ''}"
-                            sender_username = sender.username if hasattr(sender, 'username') else None
-                        else:
-                            sender_name = "Неизвестно"
-                            sender_username = None
-                    except:
-                        sender_name = "Неизвестно"
-                        sender_username = None
-                        
-                    results.append({
-                        'group': group_name,
-                        'date': message.date,
-                        'sender_name': sender_name,
-                        'sender_username': sender_username,
-                        'message': message.message,
-                        'message_id': message.id,
-                        'message_link': f"https://t.me/{group_name}/{message.id}"
-                    })
-                    
-                    # Update progress after finding a match
-                    if progress_callback and len(results) % 10 == 0:
-                        progress_callback(f"✅ Найдено сообщений: {len(results)}", None)
-            
-        except Exception as e:
-            if progress_callback:
-                progress_callback(f"❌ Ошибка при извлечении сообщений из {group_link}: {str(e)}", None)
-            
-    # Create DataFrame
-    df = pd.DataFrame(results)
+    estimated_total = elapsed_time / progress
+    remaining = estimated_total - elapsed_time
     
-    # Sort by date (newest first)
-    if not df.empty:
-        df = df.sort_values(by='date', ascending=False)
-        
-    return df
+    return format_time(remaining)
 
 def get_dataframe_excel(df):
-    """Конвертация DataFrame в файл Excel для скачивания"""
-    output = BytesIO()
+    """Convert dataframe to Excel bytes buffer."""
+    output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, sheet_name='Посты Telegram', index=False)
+        df.to_excel(writer, index=False, sheet_name='Data')
     output.seek(0)
     return output.getvalue()
 
 def get_dataframe_csv(df):
-    """Конвертация DataFrame в файл CSV для скачивания"""
-    output = BytesIO()
-    df.to_csv(output, index=False)
-    output.seek(0)
-    return output.getvalue()
+    """Convert dataframe to CSV bytes buffer."""
+    return df.to_csv(index=False).encode('utf-8')
 
-def format_time(seconds):
-    """Форматирование времени в читаемый формат"""
-    if seconds < 60:
-        return f"{seconds:.0f} сек"
-    elif seconds < 3600:
-        minutes = seconds // 60
-        seconds %= 60
-        return f"{minutes:.0f} мин {seconds:.0f} сек"
+def parse_telegram_link(link):
+    """Parse Telegram link and extract username or invite."""
+    if not link:
+        return None
+    
+    link = link.strip()
+    
+    # Handle t.me links
+    if "t.me/" in link:
+        # Handle t.me/joinchat or t.me/+
+        if "/joinchat/" in link or "/+" in link:
+            parts = link.split("/joinchat/") if "/joinchat/" in link else link.split("/+")
+            if len(parts) > 1:
+                return parts[1].strip()
+        else:
+            username = link.split("t.me/")[1].strip()
+            return username
+    
+    # Handle direct usernames or invite links
+    elif link.startswith("@"):
+        return link[1:].strip()
     else:
-        hours = seconds // 3600
-        seconds %= 3600
-        minutes = seconds // 60
-        seconds %= 60
-        return f"{hours:.0f} ч {minutes:.0f} мин {seconds:.0f} сек"
+        return link.strip()
 
-# Sidebar for inputs
-with st.sidebar:
-    st.header("🔑 Учетные данные Telegram API")
-    st.markdown("""
-    Для использования этого приложения вам нужны API-ключи Telegram. 
-    Получите их на [my.telegram.org](https://my.telegram.org/auth?to=apps).
-    
-    Вы можете добавить несколько аккаунтов для балансировки нагрузки, введя несколько наборов учетных данных API.
-    """)
-    
-    # Multiple account support
-    num_accounts = st.number_input("📊 Количество аккаунтов Telegram", min_value=1, max_value=10, value=1)
-    
-    # Create containers for each account
-    account_containers = []
-    api_credentials = []
-    
-    for i in range(num_accounts):
-        account_container = st.container()
-        with account_container:
-            st.subheader(f"📱 Аккаунт {i+1}")
-            api_id = st.text_input(f"API ID #{i+1}", type="password", key=f"api_id_{i}")
-            api_hash = st.text_input(f"API Hash #{i+1}", type="password", key=f"api_hash_{i}")
-            api_credentials.append((api_id, api_hash))
-        account_containers.append(account_container)
-    
-    st.header("🔍 Параметры поиска")
-    
-    # Group links - one per line
-    group_links = st.text_area(
-        "📋 Ссылки на группы Telegram (по одной на строку)",
-        placeholder="groupname1\ngroupname2\nhttps://t.me/groupname3",
-        help="Введите ссылки на группы Telegram или имена пользователей групп, по одной на строку"
-    )
-    
-    # Keyword or expression
-    keyword = st.text_input(
-        "🔤 Ключевое слово или выражение",
-        placeholder="Введите поисковый запрос",
-        help="Будут извлечены посты, содержащие это ключевое слово или выражение"
-    )
-    
-    # Message limit
-    message_limit = st.number_input(
-        "🔢 Максимальное количество сообщений для извлечения из каждой группы",
-        min_value=100,
-        max_value=5000,
-        value=1000,
-        step=100,
-        help="Большие значения могут занять больше времени для обработки"
-    )
-    
-    # Extract button
-    extract_button = st.button("🚀 Извлечь посты", type="primary")
+# App title and sidebar
+st.sidebar.title("🔎 Настройки Telegram API")
 
-# Main content area
-if extract_button:
-    # Check if at least one set of valid API credentials was provided
-    valid_credentials = [(i, api_id, api_hash) for i, (api_id, api_hash) in enumerate(api_credentials) if api_id and api_hash]
+# API credentials section
+with st.sidebar.expander("📱 Учетные данные API", expanded=True):
+    accounts = []
     
-    if not valid_credentials:
-        st.error("⚠️ Пожалуйста, введите как минимум один набор действительных учетных данных API Telegram")
+    account1 = {
+        "api_id": st.text_input("API ID", key="api_id_1", type="password"),
+        "api_hash": st.text_input("API Hash", key="api_hash_1", type="password"),
+        "phone": st.text_input("Номер телефона", key="phone_1", placeholder="+79123456789"),
+    }
+    accounts.append(account1)
+    
+    # Additional accounts
+    show_more_accounts = st.checkbox("Добавить дополнительные аккаунты")
+    
+    if show_more_accounts:
+        for i in range(2, 6):  # Support up to 5 accounts
+            with st.expander(f"Аккаунт {i}"):
+                account = {
+                    "api_id": st.text_input(f"API ID", key=f"api_id_{i}", type="password"),
+                    "api_hash": st.text_input(f"API Hash", key=f"api_hash_{i}", type="password"),
+                    "phone": st.text_input(f"Номер телефона", key=f"phone_{i}", placeholder="+79123456789"),
+                }
+                
+                if account["api_id"] and account["api_hash"] and account["phone"]:
+                    accounts.append(account)
+
+# Search parameters section
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔍 Параметры поиска")
+
+group_links = st.sidebar.text_area(
+    "Группы Telegram (по одной на строку)",
+    placeholder="@group_name\nt.me/group_name\nt.me/joinchat/invite_hash",
+    help="Введите ссылки на группы Telegram по одной на строку"
+)
+
+keyword = st.sidebar.text_input(
+    "Ключевое слово для поиска",
+    placeholder="Введите слово или фразу для поиска",
+)
+
+message_limit = st.sidebar.number_input(
+    "Лимит сообщений на группу",
+    min_value=10,
+    max_value=10000,
+    value=500,
+    step=100,
+    help="Максимальное количество сообщений для извлечения из каждой группы"
+)
+
+# Main content
+if st.sidebar.button("🚀 Извлечь посты", use_container_width=True, type="primary"):
+    if not accounts[0]["api_id"] or not accounts[0]["api_hash"] or not accounts[0]["phone"]:
+        st.error("❌ Пожалуйста, введите учетные данные API Telegram для первого аккаунта.")
     elif not group_links:
-        st.error("⚠️ Пожалуйста, введите хотя бы одну группу Telegram")
+        st.error("❌ Пожалуйста, введите хотя бы одну группу Telegram для поиска.")
     elif not keyword:
-        st.error("⚠️ Пожалуйста, введите ключевое слово или выражение для поиска")
+        st.error("❌ Пожалуйста, введите ключевое слово для поиска.")
     else:
-        # Process the group links (split by newline and remove empty lines)
-        group_list = [line.strip() for line in group_links.split('\n') if line.strip()]
-        
-        # Create status containers
-        status_container = st.container()
-        with status_container:
-            st.subheader("🔄 Статус аккаунтов")
-            status_placeholder = st.empty()
-        
-        progress_container = st.container()
-        with progress_container:
-            progress_bar = st.progress(0)
-            progress_text = st.empty()
-            time_info = st.empty()
-            results_info = st.empty()
-        
-        # Record start time
-        start_time = time.time()
-        posts_found = 0
-        
-        def update_progress(message, progress_value=None):
-            nonlocal posts_found
-            if "Найдено сообщений:" in message:
-                # Extract number of posts found
-                posts_found = int(message.split("Найдено сообщений:")[1].strip())
+        try:
+            # Parse Telegram group links
+            groups = [link.strip() for link in group_links.split('\n') if link.strip()]
+            groups = [parse_telegram_link(link) for link in groups]
+            groups = [group for group in groups if group]  # Remove None values
             
-            elapsed_time = time.time() - start_time
-            progress_text.text(message)
-            
-            if progress_value is not None:
-                progress_bar.progress(progress_value)
-                if progress_value > 0:
-                    estimated_total_time = elapsed_time / progress_value
-                    remaining_time = estimated_total_time - elapsed_time
-                    time_info.text(f"⏱️ Прошло: {format_time(elapsed_time)} | Осталось: {format_time(remaining_time)}")
-            
-            results_info.text(f"📊 Найдено сообщений: {posts_found}")
-        
-        with st.spinner(f"⏳ Проверка статуса аккаунта и извлечение постов с '{keyword}' из {len(group_list)} групп..."):
-            try:
-                # Run the extraction asynchronously
+            if not groups:
+                st.error("❌ Не удалось найти действительные группы Telegram. Проверьте введенные ссылки.")
+            else:
+                # Initialize progress bar and status
+                progress_bar = st.progress(0)
+                status_container = st.empty()
+                metrics_container = st.empty()
+                time_container = st.empty()
+                
+                def update_progress(message, progress_value):
+                    progress_bar.progress(progress_value)
+                    status_container.markdown(f"**Статус:** {message}")
+                
+                # Show the number of groups and accounts
+                active_accounts = [acc for acc in accounts if acc["api_id"] and acc["api_hash"] and acc["phone"]]
+                st.info(f"🔍 Поиск по {len(groups)} группам с ключевым словом '{keyword}' через {len(active_accounts)} аккаунт(ов) Telegram.")
+                
+                # Preparation phase
+                update_progress("🔄 Подготовка к поиску...", 0.05)
+                
+                # Start timing
+                start_time = time.time()
+                
+                # Main async function for extraction
                 async def run_extraction():
-                    # Dictionary to track client status
-                    clients = {}
-                    active_clients = []
-                    status_messages = []
+                    # Initialize tracking variables
+                    posts_found = 0
+                    processed_groups = 0
+                    total_messages_processed = 0
+                    start_time_inner = time.time()
                     
-                    # Initialize and check all clients
-                    update_progress("🔄 Инициализация и проверка аккаунтов Telegram...", 0.05)
-                    
-                    for i, api_id, api_hash in valid_credentials:
-                        try:
-                            client = TelegramClient(f'session_{i}', api_id, api_hash)
-                            await client.start()
-                            
-                            # Check if account is banned
-                            is_active, status_msg = await check_account_status(client)
-                            status_messages.append(f"Аккаунт {i+1}: {status_msg}")
-                            
-                            if is_active:
-                                active_clients.append(client)
-                                clients[i] = {'client': client, 'status': 'active'}
-                            else:
-                                await client.disconnect()
-                                clients[i] = {'client': None, 'status': 'inactive', 'reason': status_msg}
-                        except Exception as e:
-                            status_messages.append(f"Аккаунт {i+1}: ❌ Не удалось инициализировать - {str(e)}")
-                            clients[i] = {'client': None, 'status': 'error', 'reason': str(e)}
-                    
-                    # Update status display
-                    status_placeholder.markdown("\n".join(status_messages))
-                    
-                    update_progress("✅ Проверка аккаунтов завершена", 0.1)
-                    
-                    if not active_clients:
-                        return pd.DataFrame(), "❌ Нет активных аккаунтов. Пожалуйста, проверьте свои учетные данные API."
-                    
-                    # Distribute groups among active clients for load balancing
-                    all_results = []
-                    
-                    # Distribute groups evenly among active clients
-                    num_active_clients = len(active_clients)
-                    groups_per_client = {}
-                    
-                    for i, group in enumerate(group_list):
-                        client_idx = i % num_active_clients
-                        if client_idx not in groups_per_client:
-                            groups_per_client[client_idx] = []
-                        groups_per_client[client_idx].append(group)
-                    
-                    update_progress(f"⚖️ Распределение групп между {num_active_clients} активными аккаунтами", 0.15)
-                    
-                    # Process each client's assigned groups
-                    tasks = []
-                    for idx, groups in groups_per_client.items():
-                        client = active_clients[idx]
-                        tasks.append(extract_messages(client, groups, keyword, limit=message_limit, progress_callback=update_progress))
-                    
-                    # Wait for all tasks to complete
-                    update_progress("🔍 Извлечение сообщений из всех групп...", 0.2)
-                    results = await asyncio.gather(*tasks)
-                    
-                    # Combine all dataframes
-                    update_progress("📊 Объединение результатов...", 0.9)
-                    combined_df = pd.concat(results) if results else pd.DataFrame()
-                    
-                    # Sort by date
-                    if not combined_df.empty:
-                        combined_df = combined_df.sort_values(by='date', ascending=False)
-                    
-                    # Disconnect all clients
-                    update_progress("🔌 Отключение клиентов Telegram...", 0.95)
-                    for client in active_clients:
-                        await client.disconnect()
-                    
-                    update_progress("✅ Обработка завершена!", 1.0)
-                    return combined_df, None
-                
-                # Run the extraction asynchronously
-                df, error = asyncio.run(run_extraction())
-                
-                # Handle results
-                if error:
-                    st.error(error)
-                else:
-                    total_time = time.time() - start_time
-                    
-                    # Display results
-                    if not df.empty:
-                        st.success(f"✅ Успешно извлечено {len(df)} сообщений за {format_time(total_time)}!")
+                    # Create a metrics display function
+                    def update_metrics():
+                        elapsed = time.time() - start_time_inner
+                        remaining = estimate_remaining_time(elapsed, (processed_groups / max(1, len(groups))))
                         
-                        # Format the date column for display
-                        display_df = df.copy()
-                        display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                        col1, col2, col3 = metrics_container.columns(3)
+                        col1.metric("📊 Найдено постов", f"{posts_found}")
+                        col2.metric("🔄 Обработано групп", f"{processed_groups}/{len(groups)}")
+                        col3.metric("📝 Проверено сообщений", f"{total_messages_processed}")
                         
-                        # Create tabs for different views
-                        tab1, tab2, tab3 = st.tabs(["📊 Таблица данных", "📈 Аналитика", "📥 Скачать"])
+                        time_container.markdown(f"⏱️ Прошло: {format_time(elapsed)} | Осталось примерно: {remaining}")
+                    
+                    try:
+                        # Create and authenticate clients
+                        active_clients = []
                         
-                        with tab1:
-                            st.dataframe(display_df, use_container_width=True)
-                        
-                        with tab2:
-                            st.subheader("📊 Аналитика по найденным сообщениям")
-                            
-                            # Posts per group
-                            st.subheader("📱 Сообщения по группам")
-                            group_counts = df['group'].value_counts().reset_index()
-                            group_counts.columns = ['Группа', 'Количество сообщений']
-                            
-                            fig1 = px.bar(group_counts, 
-                                         x='Группа', 
-                                         y='Количество сообщений',
-                                         title="Распределение сообщений по группам",
-                                         color='Количество сообщений')
-                            st.plotly_chart(fig1, use_container_width=True)
-                            
-                            # Posts over time
-                            st.subheader("📅 Временная динамика сообщений")
-                            df['date_only'] = df['date'].dt.date
-                            time_series = df.groupby('date_only').size().reset_index()
-                            time_series.columns = ['Дата', 'Количество сообщений']
-                            
-                            fig2 = px.line(time_series, 
-                                          x='Дата', 
-                                          y='Количество сообщений',
-                                          title="Динамика сообщений по датам",
-                                          markers=True)
-                            st.plotly_chart(fig2, use_container_width=True)
-                            
-                            # Top senders
-                            if 'sender_username' in df.columns and not df['sender_username'].isna().all():
-                                st.subheader("👤 Топ авторов сообщений")
-                                sender_counts = df['sender_username'].value_counts().head(10).reset_index()
-                                sender_counts.columns = ['Пользователь', 'Количество сообщений']
+                        update_progress("🔌 Подключение к Telegram API...", 0.1)
+                        for i, account in enumerate(active_accounts):
+                            try:
+                                # Create client session directory
+                                session_name = f"session_{i}"
                                 
-                                fig3 = px.bar(sender_counts, 
-                                             x='Пользователь', 
-                                             y='Количество сообщений',
-                                             title="Топ-10 авторов сообщений",
-                                             color='Количество сообщений')
-                                st.plotly_chart(fig3, use_container_width=True)
+                                # Create and connect client
+                                client = TelegramClient(session_name, int(account["api_id"]), account["api_hash"])
+                                await client.connect()
+                                
+                                # Check authorization
+                                if not await client.is_user_authorized():
+                                    update_progress(f"🔑 Авторизация аккаунта {account['phone']}...", 0.1)
+                                    await client.send_code_request(account["phone"])
+                                    
+                                    # Create an input field for verification code
+                                    code_input = status_container.text_input(
+                                        f"Введите код подтверждения для {account['phone']}:",
+                                        key=f"code_{i}"
+                                    )
+                                    
+                                    if code_input:
+                                        try:
+                                            await client.sign_in(account["phone"], code_input)
+                                            status_container.success(f"✅ Аккаунт {account['phone']} успешно авторизован!")
+                                        except Exception as e:
+                                            status_container.error(f"❌ Ошибка авторизации: {str(e)}")
+                                            continue
+                                
+                                # If authorized, add to active clients
+                                if await client.is_user_authorized():
+                                    active_clients.append(client)
+                                    status_container.success(f"✅ Аккаунт {account['phone']} подключен и готов к работе")
+                            except Exception as e:
+                                status_container.error(f"❌ Ошибка подключения аккаунта {account['phone']}: {str(e)}")
                         
-                        with tab3:
-                            st.subheader("📥 Скачать результаты")
+                        # Check if we have any active clients
+                        if not active_clients:
+                            return None, "❌ Не удалось подключить ни один аккаунт Telegram. Проверьте учетные данные."
+                        
+                        # Process each group
+                        update_progress("🔍 Начинаем поиск сообщений в группах...", 0.15)
+                        
+                        results = []
+                        
+                        # Function to process a group
+                        async def process_group(group_link, client_index):
+                            nonlocal posts_found, processed_groups, total_messages_processed
                             
-                            col1, col2 = st.columns(2)
+                            client = active_clients[client_index % len(active_clients)]
                             
-                            with col1:
-                                excel_data = get_dataframe_excel(df)
-                                st.download_button(
-                                    label="📊 Скачать Excel",
-                                    data=excel_data,
-                                    file_name=f"telegram_posts_{keyword}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                    mime="application/vnd.ms-excel"
-                                )
+                            group_messages = []
                             
-                            with col2:
-                                csv_data = get_dataframe_csv(df)
-                                st.download_button(
-                                    label="📋 Скачать CSV",
-                                    data=csv_data,
-                                    file_name=f"telegram_posts_{keyword}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                    mime="text/csv"
-                                )
-                    else:
-                        st.warning(f"⚠️ Не найдено сообщений с ключевым словом '{keyword}' в указанных группах.")
+                            try:
+                                # Get entity info
+                                entity = await client.get_entity(group_link)
+                                
+                                # Get group title
+                                try:
+                                    group_info = await client(GetFullChannelRequest(channel=entity))
+                                    group_title = group_info.chats[0].title
+                                except:
+                                    group_title = group_link
+                                
+                                # Update status with current group info
+                                current_progress = 0.15 + (0.8 * processed_groups / len(groups))
+                                update_progress(f"🔍 Поиск в группе '{group_title}' ({processed_groups+1}/{len(groups)})...", current_progress)
+                                
+                                # Get message history
+                                messages_processed = 0
+                                offset_id = 0
+                                
+                                while messages_processed < message_limit:
+                                    batch_size = min(100, message_limit - messages_processed)
+                                    history = await client(GetHistoryRequest(
+                                        peer=entity,
+                                        offset_id=offset_id,
+                                        offset_date=None,
+                                        add_offset=0,
+                                        limit=batch_size,
+                                        max_id=0,
+                                        min_id=0,
+                                        hash=0
+                                    ))
+                                    
+                                    # Break if no more messages
+                                    if not history.messages:
+                                        break
+                                    
+                                    for message in history.messages:
+                                        messages_processed += 1
+                                        total_messages_processed += 1
+                                        
+                                        # Update metrics regularly
+                                        if total_messages_processed % 100 == 0:
+                                            update_metrics()
+                                        
+                                        if message.message:
+                                            # Check for keyword
+                                            if keyword.lower() in message.message.lower():
+                                                sender_id = message.from_id.user_id if hasattr(message.from_id, 'user_id') else None
+                                                
+                                                # Get sender info
+                                                sender_username = None
+                                                sender_name = None
+                                                
+                                                if sender_id:
+                                                    try:
+                                                        sender = await client.get_entity(sender_id)
+                                                        sender_username = sender.username if hasattr(sender, 'username') else None
+                                                        sender_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
+                                                    except:
+                                                        pass
+                                                
+                                                # Extract message data
+                                                message_data = {
+                                                    "message_id": message.id,
+                                                    "date": message.date,
+                                                    "group": group_title,
+                                                    "group_link": f"https://t.me/{group_link}" if not group_link.startswith('+') else f"https://t.me/joinchat/{group_link}",
+                                                    "message_link": f"https://t.me/{group_link}/{message.id}" if not group_link.startswith('+') else None,
+                                                    "text": message.message,
+                                                    "sender_id": sender_id,
+                                                    "sender_username": sender_username,
+                                                    "sender_name": sender_name,
+                                                    "views": message.views if hasattr(message, 'views') else None,
+                                                    "forwards": message.forwards if hasattr(message, 'forwards') else None,
+                                                }
+                                                
+                                                group_messages.append(message_data)
+                                                posts_found += 1
+                                        
+                                        # Update status with progress
+                                        if messages_processed % 50 == 0:
+                                            sub_progress = 0.15 + ((processed_groups + (messages_processed / message_limit)) / len(groups)) * 0.8
+                                            update_progress(f"🔍 Поиск в группе '{group_title}' ({processed_groups+1}/{len(groups)}) - {messages_processed}/{message_limit} сообщений...", sub_progress)
+                                    
+                                    # Update offset for next batch
+                                    offset_id = history.messages[-1].id
+                                
+                                # Update processed groups counter
+                                processed_groups += 1
+                                
+                                # Return the messages found in this group
+                                return group_messages
+                            
+                            except Exception as e:
+                                processed_groups += 1
+                                return []
+                        
+                        # Process groups in parallel with load balancing
+                        tasks = []
+                        for i, group in enumerate(groups):
+                            tasks.append(process_group(group, i))
+                        
+                        group_results = await asyncio.gather(*tasks)
+                        
+                        # Combine all results
+                        for group_messages in group_results:
+                            if group_messages:
+                                results.extend(group_messages)
+                        
+                        # Close all clients
+                        for client in active_clients:
+                            await client.disconnect()
+                        
+                        # Convert results to DataFrame
+                        if results:
+                            df = pd.DataFrame(results)
+                            
+                            # Format date
+                            df['date'] = df['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # Sort by date (newest first)
+                            df = df.sort_values('date', ascending=False)
+                            
+                            return df, "✅ Поиск успешно завершен!"
+                        else:
+                            return None, "⚠️ Сообщения с указанным ключевым словом не найдены."
+                        
+                    except Exception as e:
+                        for client in active_clients:
+                            try:
+                                await client.disconnect()
+                            except:
+                                pass
+                        return None, f"❌ Ошибка при выполнении поиска: {str(e)}"
                 
-            except Exception as e:
-                st.error(f"❌ Произошла ошибка: {str(e)}")
-                import traceback
-                st.error(traceback.format_exc())
+                # Helper functions for time estimation
+                def format_time(seconds):
+                    if seconds < 60:
+                        return f"{int(seconds)} сек"
+                    elif seconds < 3600:
+                        minutes = int(seconds // 60)
+                        seconds = int(seconds % 60)
+                        return f"{minutes} мин {seconds} сек"
+                    else:
+                        hours = int(seconds // 3600)
+                        minutes = int((seconds % 3600) // 60)
+                        return f"{hours} ч {minutes} мин"
+                
+                def estimate_remaining_time(elapsed, progress):
+                    if progress <= 0:
+                        return "расчет..."
+                    
+                    total_estimated = elapsed / progress
+                    remaining = total_estimated - elapsed
+                    
+                    return format_time(remaining)
+                
+                # Run the extraction
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                try:
+                    result_df, message = loop.run_until_complete(run_extraction())
+                    
+                    # Complete the progress
+                    progress_bar.progress(1.0)
+                    status_container.markdown(f"**Статус:** {message}")
+                    
+                    if result_df is not None:
+                        elapsed_time = time.time() - start_time
+                        st.success(f"✅ Поиск завершен за {format_time(elapsed_time)}. Найдено {len(result_df)} сообщений с ключевым словом '{keyword}'.")
+                        
+                        # Display results
+                        st.dataframe(result_df)
+                        
+                        # Download buttons
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.download_button(
+                                label="📥 Скачать как Excel",
+                                data=get_dataframe_excel(result_df),
+                                file_name=f"telegram_search_{keyword}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                mime="application/vnd.ms-excel"
+                            )
+                        
+                        with col2:
+                            st.download_button(
+                                label="📥 Скачать как CSV",
+                                data=get_dataframe_csv(result_df),
+                                file_name=f"telegram_search_{keyword}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                    else:
+                        st.warning(message)
+                
+                except Exception as e:
+                    st.error(f"❌ Произошла ошибка: {str(e)}")
+                
+                finally:
+                    loop.close()
+        
+        except Exception as e:
+            st.error(f"❌ Неожиданная ошибка: {str(e)}")
+
 else:
-    # App description and instructions when first loaded
-    st.title("🔎 Поиск сообщений в Telegram")
-    
+    # Show welcome screen when not running
+    st.title("🔍 Telegram Group Message Search")
     st.markdown("""
-    ## 📱 Добро пожаловать в приложение для поиска сообщений в Telegram!
+    ### 👋 Добро пожаловать в инструмент поиска сообщений в группах Telegram!
     
-    Это приложение позволяет извлекать сообщения из групп Telegram, содержащие указанные ключевые слова.
+    #### 📋 Инструкции:
+    1. Введите учетные данные API Telegram в боковой панели
+    2. Добавьте ссылки на группы Telegram для поиска
+    3. Укажите ключевое слово для поиска
+    4. Настройте лимит сообщений (если необходимо)
+    5. Нажмите кнопку "Извлечь посты", чтобы начать
     
-    ### 🚀 Как использовать:
+    #### 🔑 Где получить данные API:
+    1. Перейдите на [my.telegram.org](https://my.telegram.org/)
+    2. Войдите в свой аккаунт Telegram
+    3. Перейдите в "API development tools"
+    4. Создайте новое приложение и получите API ID и Hash
     
-    1. **Введите учетные данные API Telegram** в боковой панели (получите их на [my.telegram.org](https://my.telegram.org))
-    2. **Добавьте несколько аккаунтов** для распределения нагрузки (необязательно)
-    3. **Укажите группы Telegram** для поиска (по одной на строку)
-    4. **Введите ключевое слово** или фразу для поиска
-    5. **Настройте лимит сообщений** для извлечения из каждой группы
-    6. **Нажмите "Извлечь посты"** и дождитесь завершения обработки
+    #### 📱 Поддерживаемые форматы ссылок на группы:
+    - `@username`
+    - `t.me/username`
+    - `t.me/joinchat/invite_hash`
+    - `t.me/+invite_hash`
     
-    ### 📊 Функции:
-    
-    - Поиск по нескольким группам Telegram
-    - Балансировка нагрузки на несколько аккаунтов
-    - Отображение результатов в удобной таблице
-    - Аналитика и визуализация найденных данных
-    - Экспорт результатов в Excel или CSV
-    
-    ### ⚠️ Примечание о ограничениях Telegram API:
-    
-    Telegram имеет ограничения на частоту запросов. Используйте несколько аккаунтов для обхода этих ограничений при работе с большим количеством групп.
+    #### ⚙️ Конфиденциальность:
+    - Все данные учетных записей остаются на вашем устройстве
+    - Приложение не сохраняет и не передает ваши данные API
     """)
     
-    st.info("ℹ️ Начните работу, введя необходимую информацию в боковой панели слева и нажав кнопку 'Извлечь посты'.")                    
+    # Show feature summary
+    with st.expander("🌟 Возможности приложения"):
+        st.markdown("""
+        - 🔍 Поиск сообщений по ключевым словам в нескольких группах
+        - 👥 Поддержка нескольких аккаунтов Telegram для обхода ограничений API
+        - 📊 Экспорт результатов в Excel и CSV
+        - ⏱️ Оценка оставшегося времени и прогресса
+        - 🔄 Параллельная обработка групп для ускорения поиска
+        """)
